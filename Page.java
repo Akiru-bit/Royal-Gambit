@@ -33,7 +33,8 @@ public class Page extends JFrame {
     static final Color GOLD       = RoyalGambit.GOLD;
     static final Color GOLD_LIGHT = RoyalGambit.GOLD_LIGHT;
     static final Color CREAM      = RoyalGambit.CREAM;
-    static final Color MUTED      = RoyalGambit.MUTED;
+    // Brighter than RoyalGambit.MUTED so secondary text stays readable on the dark picture background
+    static final Color MUTED      = new Color(0xE6E0CC);
 
     // Dark text colours used on the light-blue dialogs (Player vs Bot, Player vs Player, Chess Puzzle)
     static final Color INK        = new Color(0x0B2545);   // main text
@@ -249,6 +250,210 @@ public class Page extends JFrame {
         return l;
     }
 
+    // =====================================================================
+    //  Custom title bar (replaces the native one so we decide which buttons exist)
+    //    main menu window -> Close only
+    //    sub windows      -> Minimize, Maximize / Restore, Close
+    // =====================================================================
+    static Color goldA(int alpha) { return new Color(GOLD.getRed(), GOLD.getGreen(), GOLD.getBlue(), alpha); }
+
+    static javax.swing.border.Border windowBorder() { return BorderFactory.createLineBorder(goldA(170), 1); }
+
+    /** Puts a custom title bar at the top of a JFrame / JDialog (it sits in the root pane's menu-bar slot). */
+    static void installTitleBar(JRootPane rp, Window w, String title, boolean canMin, boolean canMax) {
+        JMenuBar holder = new JMenuBar();
+        holder.setLayout(new BorderLayout());
+        holder.setBorder(null);
+        holder.setOpaque(false);
+        holder.add(new TitleBar(w, title, canMin, canMax), BorderLayout.CENTER);
+        rp.setJMenuBar(holder);
+        rp.setBorder(windowBorder());
+    }
+
+    static class TitleBar extends JPanel {
+        private final Window win;
+        private final boolean canMax;
+        private final CtlButton maxBtn;
+        private Rectangle restoreBounds;
+        private boolean maxed = false;
+        private Dimension baseSize;      // window size before maximizing; the content is stretched relative to it
+        private Point grab;
+
+        TitleBar(Window win, String title, boolean canMin, boolean canMax) {
+            super(new BorderLayout());
+            this.win = win;
+            this.canMax = canMax;
+            setOpaque(true);
+            setBackground(THEME_DARK);
+            setBorder(BorderFactory.createMatteBorder(0, 0, 1, 0, goldA(120)));
+            setPreferredSize(new Dimension(10, 36));
+
+            JLabel text = lbl(title, 13, Font.PLAIN, CREAM, RoyalGambit.SANS);
+            text.setBorder(new EmptyBorder(0, 14, 0, 0));
+            add(text, BorderLayout.CENTER);
+
+            JPanel btns = new JPanel(new FlowLayout(FlowLayout.RIGHT, 0, 0));
+            btns.setOpaque(false);
+            if (canMin) btns.add(new CtlButton(0, "Minimize", this::minimize));
+            maxBtn = canMax ? new CtlButton(1, "Maximize", this::toggleMaximize) : null;
+            if (maxBtn != null) btns.add(maxBtn);
+            btns.add(new CtlButton(2, "Close", this::close));
+            add(btns, BorderLayout.EAST);
+
+            // drag the window by its title bar; double-click toggles maximize
+            MouseAdapter drag = new MouseAdapter() {
+                @Override public void mousePressed(MouseEvent e) {
+                    if (!SwingUtilities.isLeftMouseButton(e) || maxed) { grab = null; return; }
+                    Point p = e.getLocationOnScreen();
+                    grab = new Point(p.x - win.getX(), p.y - win.getY());
+                }
+                @Override public void mouseDragged(MouseEvent e) {
+                    if (grab == null || maxed) return;
+                    Point p = e.getLocationOnScreen();
+                    win.setLocation(p.x - grab.x, p.y - grab.y);
+                }
+                @Override public void mouseReleased(MouseEvent e) { grab = null; }
+                @Override public void mouseClicked(MouseEvent e) {
+                    if (TitleBar.this.canMax && SwingUtilities.isLeftMouseButton(e) && e.getClickCount() == 2)
+                        toggleMaximize();
+                }
+            };
+            addMouseListener(drag);
+            addMouseMotionListener(drag);
+            text.addMouseListener(drag);
+            text.addMouseMotionListener(drag);
+        }
+
+        void close() { win.dispatchEvent(new WindowEvent(win, WindowEvent.WINDOW_CLOSING)); }
+
+        /** A modal dialog cannot be iconified itself, so minimizing it minimizes the main window
+         *  (its owned dialogs are hidden with it and come back when the window is restored). */
+        void minimize() {
+            Window w = win;
+            while (w != null && !(w instanceof Frame)) w = w.getOwner();
+            if (w instanceof Frame) ((Frame) w).setExtendedState(Frame.ICONIFIED);
+        }
+
+        /** Stretches the window's content (sizes + fonts) to fit the maximized window, or restores it. */
+        private void rescaleContent() {
+            if (!(win instanceof RootPaneContainer) || baseSize == null) return;
+            float f = 1f;
+            if (maxed) {
+                Dimension cur = win.getSize();
+                f = Math.min(cur.width / (float) baseSize.width, cur.height / (float) baseSize.height);
+                f = Math.max(1f, Math.min(f, 2.2f));
+            }
+            scaleTree(((RootPaneContainer) win).getContentPane(), f);
+        }
+
+        void toggleMaximize() {
+            if (!canMax) return;
+            if (!maxed) {
+                restoreBounds = win.getBounds();
+                baseSize = win.getSize();
+                GraphicsConfiguration gc = win.getGraphicsConfiguration();
+                Rectangle sb = gc != null ? gc.getBounds()
+                        : GraphicsEnvironment.getLocalGraphicsEnvironment().getMaximumWindowBounds();
+                Insets in = gc != null ? Toolkit.getDefaultToolkit().getScreenInsets(gc) : new Insets(0, 0, 0, 0);
+                win.setBounds(sb.x + in.left, sb.y + in.top,
+                        sb.width - in.left - in.right, sb.height - in.top - in.bottom);
+            } else if (restoreBounds != null) {
+                win.setBounds(restoreBounds);
+            }
+            maxed = !maxed;
+            rescaleContent();                       // stretch (or shrink back) everything inside the window
+            maxBtn.restore = maxed;
+            maxBtn.setToolTipText(maxed ? "Restore" : "Maximize");
+            maxBtn.repaint();
+            win.validate();
+            win.repaint();
+        }
+    }
+
+    /** Scales fixed sizes and fonts of a component tree by f (f = 1 puts the originals back). */
+    static void scaleTree(Component c, float f) {
+        if (c instanceof JComponent) {
+            JComponent jc = (JComponent) c;
+            Object[] o = (Object[]) jc.getClientProperty("rg.orig");
+            if (o == null) {
+                o = new Object[] {
+                    jc.isPreferredSizeSet() ? jc.getPreferredSize() : null,
+                    jc.isMinimumSizeSet()   ? jc.getMinimumSize()   : null,
+                    jc.isMaximumSizeSet()   ? jc.getMaximumSize()   : null,
+                    jc.isFontSet()          ? jc.getFont()          : null };
+                jc.putClientProperty("rg.orig", o);
+            }
+            jc.setPreferredSize(scaledSize((Dimension) o[0], f));
+            jc.setMinimumSize(scaledSize((Dimension) o[1], f));
+            jc.setMaximumSize(scaledSize((Dimension) o[2], f));
+            Font fo = (Font) o[3];
+            if (fo != null) jc.setFont(f == 1f ? fo : fo.deriveFont(fo.getSize2D() * f));
+            jc.invalidate();
+        }
+        if (c instanceof Container)
+            for (Component k : ((Container) c).getComponents()) scaleTree(k, f);
+    }
+
+    static Dimension scaledSize(Dimension d, float f) {
+        if (d == null || f == 1f) return d;
+        return new Dimension(d.width >= 20000 ? d.width : Math.round(d.width * f),
+                             d.height >= 20000 ? d.height : Math.round(d.height * f));
+    }
+
+    /** One title-bar button: kind 0 = minimize, 1 = maximize / restore, 2 = close. */
+    static class CtlButton extends JComponent {
+        final int kind;
+        boolean hover, restore;
+
+        CtlButton(int kind, String tip, Runnable r) {
+            this.kind = kind;
+            Dimension d = new Dimension(46, 35);
+            setPreferredSize(d);
+            setMinimumSize(d);
+            setMaximumSize(d);
+            setToolTipText(tip);
+            addMouseListener(new MouseAdapter() {
+                @Override public void mouseEntered(MouseEvent e) { hover = true; repaint(); }
+                @Override public void mouseExited(MouseEvent e)  { hover = false; repaint(); }
+                @Override public void mouseReleased(MouseEvent e) {
+                    if (SwingUtilities.isLeftMouseButton(e) && contains(e.getPoint())) r.run();
+                }
+            });
+        }
+
+        @Override protected void paintComponent(Graphics g0) {
+            Graphics2D g = (Graphics2D) g0.create();
+            g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+            int w = getWidth(), h = getHeight();
+            if (hover) {
+                g.setColor(kind == 2 ? new Color(0xE81123) : new Color(255, 255, 255, 38));
+                g.fillRect(0, 0, w, h);
+            }
+            g.setColor(kind == 2 && hover ? Color.WHITE : CREAM);
+            g.setStroke(new BasicStroke(1.3f));
+            int cx = w / 2, cy = h / 2;
+            switch (kind) {
+                case 0:
+                    g.drawLine(cx - 5, cy, cx + 5, cy);
+                    break;
+                case 1:
+                    if (!restore) {
+                        g.drawRect(cx - 5, cy - 5, 10, 10);
+                    } else {
+                        g.drawRect(cx - 5, cy - 2, 7, 7);
+                        g.drawLine(cx - 2, cy - 5, cx + 5, cy - 5);
+                        g.drawLine(cx + 5, cy - 5, cx + 5, cy + 2);
+                        g.drawLine(cx - 2, cy - 5, cx - 2, cy - 2);
+                    }
+                    break;
+                default:
+                    g.drawLine(cx - 5, cy - 5, cx + 5, cy + 5);
+                    g.drawLine(cx - 5, cy + 5, cx + 5, cy - 5);
+            }
+            g.dispose();
+        }
+    }
+
     static JDialog dialog(Component parent, String title, int w, int h) {
         return dialog(parent, title, w, h, false);
     }
@@ -257,13 +462,22 @@ public class Page extends JFrame {
     static JDialog dialog(Component parent, String title, int w, int h, boolean lightBlue) {
         Window owner = parent instanceof Window ? (Window) parent : SwingUtilities.getWindowAncestor(parent);
         JDialog d = new JDialog(owner, title, Dialog.ModalityType.APPLICATION_MODAL);
+        d.setUndecorated(true);                                   // custom title bar below replaces the native one
+        installTitleBar(d.getRootPane(), d, title, true, true);   // Minimize, Maximize, Close
         Bg p = new Bg();
         p.lightBlue = lightBlue;
+        p.scrim = 150;
         p.setBorder(new EmptyBorder(22, 26, 20, 26));
         d.setContentPane(p);
         d.setSize(w, h);
-        d.setResizable(false);
         d.setLocationRelativeTo(parent);
+        return d;
+    }
+
+    /** Dialog for the top-right Menu pages (Profile, Stats, Achievements, Settings): Close button only. */
+    static JDialog menuDialog(Component parent, String title, int w, int h) {
+        JDialog d = dialog(parent, title, w, h, false);
+        installTitleBar(d.getRootPane(), d, title, false, false);   // no Minimize, no Maximize
         return d;
     }
 
@@ -278,7 +492,7 @@ public class Page extends JFrame {
         JLabel t = ink ? lbl(title, 26, Font.BOLD, INK, RoyalGambit.SERIF)
                        : lbl(title, 26, Font.PLAIN, GOLD, RoyalGambit.SERIF);
         JLabel s = ink ? lbl(sub, 15, Font.BOLD, INK_SOFT, RoyalGambit.SANS)
-                       : lbl(sub, 14, Font.PLAIN, MUTED, RoyalGambit.SANS);
+                       : lbl(sub, 16, Font.PLAIN, MUTED, RoyalGambit.SANS);
         t.setAlignmentX(Component.CENTER_ALIGNMENT);
         s.setAlignmentX(Component.CENTER_ALIGNMENT);
         p.add(t);
@@ -362,6 +576,7 @@ public class Page extends JFrame {
         private java.awt.image.BufferedImage cache;
         private int cw, ch;
         boolean lightBlue;   // true = soft light-blue gradient instead of the background picture
+        int scrim = 0;       // 0-255: dark overlay on top of the picture so light text stays readable
         Bg() { setLayout(new BorderLayout()); }
 
         /** Whole image stretched to fill the panel, so the full frame is always visible (no bars, no crop).
@@ -403,6 +618,10 @@ public class Page extends JFrame {
                 float r = Math.max(w, h) * 0.65f;
                 g.setPaint(new RadialGradientPaint(new Point2D.Float(w / 2f, h * 0.42f), r,
                         new float[] { 0f, 1f }, new Color[] { THEME_LIGHT, THEME_DARK }));
+                g.fillRect(0, 0, w, h);
+            }
+            if (!lightBlue && scrim > 0) {
+                g.setColor(new Color(0, 0, 0, scrim));
                 g.fillRect(0, 0, w, h);
             }
             g.dispose();
@@ -582,7 +801,7 @@ public class Page extends JFrame {
             g.setFont(new Font(RoyalGambit.SANS, Font.BOLD, 15));
             g.drawString(bot.name, tx, h / 2 - 3);
             g.setColor(INK_SOFT);
-            g.setFont(new Font(RoyalGambit.SANS, Font.PLAIN, 12));
+            g.setFont(new Font(RoyalGambit.SANS, Font.BOLD, 13));
             g.drawString(bot.tagline, tx, h / 2 + 15);
             g.dispose();
         }
@@ -761,7 +980,7 @@ public class Page extends JFrame {
         JPanel p = (JPanel) d.getContentPane();
         p.add(header("GLOBAL MATCH", "Finding a worthy rival..."), BorderLayout.NORTH);
 
-        JLabel status = lbl("Searching for an opponent", 17, Font.PLAIN, CREAM, RoyalGambit.SANS);
+        JLabel status = lbl("Searching for an opponent", 18, Font.BOLD, Color.WHITE, RoyalGambit.SANS);
         status.setHorizontalAlignment(SwingConstants.CENTER);
         p.add(status, BorderLayout.CENTER);
 
@@ -843,13 +1062,13 @@ public class Page extends JFrame {
             }
 
             // title
-            g.setFont(new Font(RoyalGambit.SANS, Font.BOLD, 13));
+            g.setFont(new Font(RoyalGambit.SANS, Font.BOLD, 14));
             g.setColor(open ? INK : INK_SOFT);
             int y = 92;
             for (String line : wrap(STAGES[idx].title, g.getFontMetrics(), w - 18)) { centered(g, line, cx, y); y += 17; }
 
             // status line
-            g.setFont(new Font(RoyalGambit.SANS, Font.BOLD, 11));
+            g.setFont(new Font(RoyalGambit.SANS, Font.BOLD, 12));
             g.setColor(done ? new Color(0x0A5C2B) : INK_SOFT);
             centered(g, !open ? "LOCKED" : done ? "COMPLETED" : "TAP TO START", cx, h - 38);
 
@@ -1186,7 +1405,7 @@ public class Page extends JFrame {
             g.setFont(new Font(RoyalGambit.SERIF, Font.BOLD, 22));
             g.drawString(COACH.name, 100, 38);
             g.setColor(MUTED);
-            g.setFont(new Font(RoyalGambit.SANS, Font.PLAIN, 14));
+            g.setFont(new Font(RoyalGambit.SANS, Font.PLAIN, 15));
             g.drawString(COACH.tagline, 100, 60);
             g.dispose();
         }
@@ -1225,8 +1444,8 @@ public class Page extends JFrame {
             g.setStroke(new BasicStroke(1.5f));
             g.draw(bubble);
 
-            g.setFont(new Font(RoyalGambit.SANS, Font.PLAIN, 16));
-            g.setColor(CREAM);
+            g.setFont(new Font(RoyalGambit.SANS, Font.PLAIN, 18));
+            g.setColor(Color.WHITE);
             FontMetrics fm = g.getFontMetrics();
             int y = tail + 36, rem = shown;
             for (String line : wrap(full, fm, w - 44)) {
@@ -1266,7 +1485,7 @@ public class Page extends JFrame {
         final int[] step = { 0 };
         final Runnable[] render = new Runnable[1];
 
-        JLabel stepLbl = lbl("", 14, Font.PLAIN, MUTED, RoyalGambit.SANS);
+        JLabel stepLbl = lbl("", 15, Font.BOLD, MUTED, RoyalGambit.SANS);
         stepLbl.setHorizontalAlignment(SwingConstants.CENTER);
         OutlineButton skip = outline("SKIP & PLAY", 170, 40, 13, () -> {
             bubble.stop();
@@ -1379,7 +1598,7 @@ public class Page extends JFrame {
             setBorder(new EmptyBorder(0, 0, 0, 0));
             setFocusPainted(false);
             setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
-            setPreferredSize(new Dimension(210, 42));
+            setPreferredSize(new Dimension(220, 44));
             addActionListener(e -> r.run());
         }
         @Override protected void paintComponent(Graphics g0) {
@@ -1395,8 +1614,8 @@ public class Page extends JFrame {
             }
             g.setColor(hot ? GOLD_LIGHT : GOLD);
             drawIcon(g, kind, 26, h / 2.0, 8);
-            g.setColor(hot ? GOLD_LIGHT : CREAM);
-            g.setFont(new Font(RoyalGambit.SANS, Font.BOLD, 14));
+            g.setColor(hot ? GOLD_LIGHT : Color.WHITE);
+            g.setFont(new Font(RoyalGambit.SANS, Font.BOLD, 15));
             FontMetrics fm = g.getFontMetrics();
             g.drawString(getText(), 48, (h - fm.getHeight()) / 2 + fm.getAscent());
             g.dispose();
@@ -1519,7 +1738,7 @@ public class Page extends JFrame {
             g.setFont(new Font(RoyalGambit.SERIF, Font.PLAIN, Math.max(22, (int) (h * 0.38))));
             centered(g, value, w / 2, (int) (h * 0.55));
             g.setColor(MUTED);
-            g.setFont(new Font(RoyalGambit.SANS, Font.PLAIN, 12));
+            g.setFont(new Font(RoyalGambit.SANS, Font.BOLD, 14));
             centered(g, label, w / 2, (int) (h * 0.80));
             g.dispose();
         }
@@ -1551,15 +1770,15 @@ public class Page extends JFrame {
             if (got) { g.setColor(GOLD_LIGHT); g.fill(star); }
             else     { g.setColor(new Color(MUTED.getRed(), MUTED.getGreen(), MUTED.getBlue(), 140)); g.draw(star); }
 
-            g.setColor(got ? CREAM : MUTED);
-            g.setFont(new Font(RoyalGambit.SANS, Font.BOLD, 15));
+            g.setColor(got ? Color.WHITE : MUTED);
+            g.setFont(new Font(RoyalGambit.SANS, Font.BOLD, 16));
             g.drawString(name, 62, h / 2 - 3);
             g.setColor(MUTED);
-            g.setFont(new Font(RoyalGambit.SANS, Font.PLAIN, 12));
+            g.setFont(new Font(RoyalGambit.SANS, Font.PLAIN, 13));
             g.drawString(desc, 62, h / 2 + 15);
 
             g.setColor(got ? GOLD_LIGHT : MUTED);
-            g.setFont(new Font(RoyalGambit.SANS, Font.BOLD, 11));
+            g.setFont(new Font(RoyalGambit.SANS, Font.BOLD, 12));
             String st = got ? "UNLOCKED" : "LOCKED";
             g.drawString(st, w - 16 - g.getFontMetrics().stringWidth(st), h / 2 + 4);
             g.dispose();
@@ -1576,7 +1795,7 @@ public class Page extends JFrame {
 
     // ---- dialogs ----
     static void showProfile(Component parent, String player, Consumer<String> onNameSaved) {
-        JDialog d = dialog(parent, "Profile", 520, 640);
+        JDialog d = menuDialog(parent, "Profile", 520, 640);
         JPanel p = (JPanel) d.getContentPane();
         p.add(header("PROFILE", "Choose your name and avatar"), BorderLayout.NORTH);
 
@@ -1602,8 +1821,8 @@ public class Page extends JFrame {
         name.setBorder(BorderFactory.createCompoundBorder(
                 BorderFactory.createMatteBorder(0, 0, 2, 0, GOLD), new EmptyBorder(2, 6, 2, 6)));
         RoyalGambit.fix(name, 280, 42);
-        JLabel rank = lbl("Rank: " + rankTitle(), 14, Font.PLAIN, GOLD, RoyalGambit.SANS);
-        JLabel avName = lbl(BOTS[sel[0]].name, 13, Font.PLAIN, MUTED, RoyalGambit.SANS);
+        JLabel rank = lbl("Rank: " + rankTitle(), 16, Font.BOLD, GOLD, RoyalGambit.SANS);
+        JLabel avName = lbl(BOTS[sel[0]].name, 15, Font.BOLD, MUTED, RoyalGambit.SANS);
 
         JPanel grid = new JPanel(new GridLayout(2, 5, 8, 8));
         grid.setOpaque(false);
@@ -1651,7 +1870,7 @@ public class Page extends JFrame {
     }
 
     static void showStats(Component parent, String player) {
-        JDialog d = dialog(parent, "Stats", 560, 470);
+        JDialog d = menuDialog(parent, "Stats", 560, 470);
         JPanel p = (JPanel) d.getContentPane();
         p.add(header("STATS", player == null || player.isEmpty() ? "Your journey so far" : player + "'s journey so far"), BorderLayout.NORTH);
 
@@ -1668,7 +1887,7 @@ public class Page extends JFrame {
 
         JLabel foot = lbl("Vs Bot: " + stat("bot") + "    Local: " + stat("local") + "    Global: " + stat("global")
                 + "    |    Puzzles solved: " + completedCount() + " / " + STAGES.length,
-                13, Font.PLAIN, MUTED, RoyalGambit.SANS);
+                14, Font.BOLD, MUTED, RoyalGambit.SANS);
         foot.setHorizontalAlignment(SwingConstants.CENTER);
         foot.setBorder(new EmptyBorder(14, 0, 0, 0));
 
@@ -1682,7 +1901,7 @@ public class Page extends JFrame {
     }
 
     static void showAchievements(Component parent) {
-        JDialog d = dialog(parent, "Achievements", 560, 620);
+        JDialog d = menuDialog(parent, "Achievements", 560, 620);
         JPanel p = (JPanel) d.getContentPane();
         boolean[] got = achievements();
         int n = 0;
@@ -1708,18 +1927,18 @@ public class Page extends JFrame {
     }
 
     static void showSettings(Component parent) {
-        JDialog d = dialog(parent, "Settings", 480, 450);
+        JDialog d = menuDialog(parent, "Settings", 480, 450);
         JPanel p = (JPanel) d.getContentPane();
         p.add(header("SETTINGS", "Make it yours"), BorderLayout.NORTH);
 
         int vol = getI("settings.volume", 70);
-        JLabel vl = lbl("Sound effects volume: " + vol + "%", 15, Font.BOLD, CREAM, RoyalGambit.SANS);
+        JLabel vl = lbl("Sound effects volume: " + vol + "%", 16, Font.BOLD, Color.WHITE, RoyalGambit.SANS);
         JSlider sl = new JSlider(0, 100, vol);
         sl.setOpaque(false);
         sl.setForeground(GOLD);
         sl.addChangeListener(e -> vl.setText("Sound effects volume: " + sl.getValue() + "%"));
 
-        JLabel ll = lbl("Language", 15, Font.BOLD, CREAM, RoyalGambit.SANS);
+        JLabel ll = lbl("Language", 16, Font.BOLD, Color.WHITE, RoyalGambit.SANS);
         JComboBox<String> cb = new JComboBox<>(LANGUAGES);
         cb.setSelectedItem(getS("settings.language", LANGUAGES[0]));
         cb.setBackground(BG_LIGHT);
@@ -1822,6 +2041,7 @@ public class Page extends JFrame {
     final String login;   // username used to log in (the nickname is saved under it)
     String player;        // current nickname (can be changed in Profile)
     final Bg root = new Bg();
+    { root.scrim = 70; }
     final JLabel title = new JLabel("ROYAL GAMBIT", SwingConstants.CENTER);
     final JLabel welcome;
     final OutlineButton vsBot = new OutlineButton("PLAYER VS BOT");
@@ -1835,12 +2055,13 @@ public class Page extends JFrame {
 
     Page(String player) {
         super("Royal Gambit");
+        setUndecorated(true);                     // custom title bar: Close only (no minimize / maximize)
         this.login = player;
         this.player = nickname(login, player);
         setDefaultCloseOperation(EXIT_ON_CLOSE);
 
         welcome = new JLabel(welcomeText(this.player), SwingConstants.CENTER);
-        welcome.setForeground(MUTED);
+        welcome.setForeground(Color.WHITE);
         title.setForeground(GOLD);
 
         account = new AccountButton(this::showAccountMenu);
@@ -1877,6 +2098,7 @@ public class Page extends JFrame {
             @Override public void componentResized(ComponentEvent e) { relayout(); }
         });
         setContentPane(root);
+        installTitleBar(getRootPane(), this, "Royal Gambit", false, false);
         setMinimumSize(new Dimension(420, 560));
         setSize(1100, 700);                       // size used when the window is restored down
         setLocationRelativeTo(null);
@@ -1910,12 +2132,12 @@ public class Page extends JFrame {
         if (on == fullScreen) return;
         GraphicsDevice dev = GraphicsEnvironment.getLocalGraphicsEnvironment().getDefaultScreenDevice();
         fullScreen = on;
-        dispose();
-        setUndecorated(on);
-        if (on) dev.setFullScreenWindow(this);
-        else dev.setFullScreenWindow(null);
-        setVisible(true);
+        getJMenuBar().setVisible(!on);                         // hide the custom title bar in full screen
+        getRootPane().setBorder(on ? null : windowBorder());
+        dev.setFullScreenWindow(on ? this : null);
         if (!on) setExtendedState(JFrame.NORMAL);
+        revalidate();
+        repaint();
         SwingUtilities.invokeLater(this::relayout);
     }
 
@@ -1996,7 +2218,7 @@ public class Page extends JFrame {
         RoyalGambit.fix(title, Math.max(200, w - 32), (int) (s * 1.3) + top + 4);
 
         int wb = (int) (bh * 0.7);
-        welcome.setFont(new Font(RoyalGambit.SANS, Font.PLAIN, Math.round(base)));
+        welcome.setFont(new Font(RoyalGambit.SANS, Font.BOLD, Math.round(base * 1.1f)));
         welcome.setBorder(new EmptyBorder(0, 0, wb, 0));
         RoyalGambit.fix(welcome, bw, (int) (base * 1.5) + wb);
 
