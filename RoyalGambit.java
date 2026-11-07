@@ -349,6 +349,40 @@ public class RoyalGambit {
     }
 
     // =====================================================================
+    //  Loading dialog: only appears if the work is slow (weak signal)
+    // =====================================================================
+    static class LoadingDialog {
+        static final int DELAY_MS = 600;          // operations faster than this never show the dialog
+        private final JDialog dialog;
+        private final Timer showTimer;
+
+        LoadingDialog(Component parent, String text) {
+            Window owner = parent == null ? null : SwingUtilities.getWindowAncestor(parent);
+            if (owner == null && parent instanceof Window) owner = (Window) parent;
+            dialog = new JDialog(owner, "Please wait", Dialog.ModalityType.APPLICATION_MODAL);
+            dialog.setDefaultCloseOperation(WindowConstants.DO_NOTHING_ON_CLOSE);
+            dialog.setResizable(false);
+            JProgressBar bar = new JProgressBar();
+            bar.setIndeterminate(true);
+            JLabel label = new JLabel(text, SwingConstants.CENTER);
+            JPanel box = new JPanel(new BorderLayout(0, 12));
+            box.setBorder(new EmptyBorder(18, 24, 18, 24));
+            box.add(label, BorderLayout.NORTH);
+            box.add(bar, BorderLayout.CENTER);
+            dialog.getContentPane().add(box);
+            dialog.pack();
+            dialog.setSize(Math.max(dialog.getWidth(), 300), dialog.getHeight());
+            dialog.setLocationRelativeTo(owner);
+            showTimer = new Timer(DELAY_MS, ev -> dialog.setVisible(true));   // blocks until close()
+            showTimer.setRepeats(false);
+        }
+        /** Call before starting the background work. */
+        void start() { showTimer.start(); }
+        /** Call from done(): cancels the pending dialog or closes the visible one. */
+        void close() { showTimer.stop(); dialog.setVisible(false); dialog.dispose(); }
+    }
+
+    // =====================================================================
     //  Mailer: minimal SMTP-over-SSL client (no libraries)
     //  Reads ~/.royalgambit-mail.properties  (host, port, user, password, from)
     // =====================================================================
@@ -363,8 +397,10 @@ public class RoyalGambit {
             int port = Integer.parseInt(c.getProperty("port", "465"));
             String from = c.getProperty("from", user);
 
-            try (SSLSocket s = (SSLSocket) SSLSocketFactory.getDefault().createSocket(host, port)) {
+            try (SSLSocket s = (SSLSocket) SSLSocketFactory.getDefault().createSocket()) {
                 s.setSoTimeout(15000);
+                s.connect(new java.net.InetSocketAddress(host, port), 15000);   // don't hang forever on a bad signal
+                s.startHandshake();
                 BufferedReader in = new BufferedReader(new InputStreamReader(s.getInputStream(), StandardCharsets.UTF_8));
                 BufferedWriter out = new BufferedWriter(new OutputStreamWriter(s.getOutputStream(), StandardCharsets.UTF_8));
                 expect(in, "220");
@@ -386,6 +422,15 @@ public class RoyalGambit {
                 try { cmd(in, out, "QUIT", "221"); } catch (Exception ignored) { }
             }
         }
+        /** Turns network exceptions into a message a player can understand. */
+        static String friendly(Exception ex) {
+            if (ex instanceof java.net.SocketTimeoutException)
+                return "Connection timed out. Your signal may be weak - please try again.";
+            if (ex instanceof java.net.UnknownHostException || ex instanceof java.net.ConnectException
+                    || ex instanceof java.net.NoRouteToHostException)
+                return "No internet connection. Please check your signal and try again.";
+            return ex.getMessage();
+        }
         static String b64(String s) { return Base64.getEncoder().encodeToString(s.getBytes(StandardCharsets.UTF_8)); }
         static void cmd(BufferedReader in, BufferedWriter out, String line, String code) throws IOException {
             out.write(line + "\r\n"); out.flush();
@@ -399,6 +444,202 @@ public class RoyalGambit {
                 if (line == null) throw new IOException("Mail server closed the connection");
             } while (line.length() > 3 && line.charAt(3) == '-');
             if (!line.startsWith(code)) throw new IOException("Mail server said: " + line);
+        }
+    }
+
+    // =====================================================================
+    //  Google sign-in (OAuth 2.0 for desktop apps: system browser + PKCE + loopback redirect)
+    //  Reads ~/.royalgambit-google.properties  (client_id, client_secret)
+    // =====================================================================
+    static class GoogleAuth {
+        static final File CONFIG = new File(System.getProperty("user.home"), ".royalgambit-google.properties");
+        static boolean configured() {
+            if (!CONFIG.exists()) return false;
+            try (InputStream in = new FileInputStream(CONFIG)) {
+                Properties c = new Properties(); c.load(in);
+                return !c.getProperty("client_id", "").isBlank();
+            } catch (IOException e) { return false; }
+        }
+
+        static class Cancelled extends Exception { Cancelled() { super("Cancelled"); } }
+
+        /** Lets the UI abort a sign-in that is waiting for the browser. */
+        static class Session {
+            final java.util.concurrent.CompletableFuture<java.util.Map<String, String>> result =
+                    new java.util.concurrent.CompletableFuture<>();
+            void cancel() { result.completeExceptionally(new Cancelled()); }
+        }
+
+        /** Opens the browser, waits for the player to sign in. @return {email, displayName} */
+        static String[] signIn(Session session) throws Exception {
+            Properties c = new Properties();
+            try (InputStream in = new FileInputStream(CONFIG)) { c.load(in); }
+            String clientId = c.getProperty("client_id", "").trim();
+            String secret = c.getProperty("client_secret", "").trim();
+
+            SecureRandom rnd = new SecureRandom();
+            byte[] vb = new byte[48]; rnd.nextBytes(vb);
+            String verifier = Base64.getUrlEncoder().withoutPadding().encodeToString(vb);
+            String challenge = Base64.getUrlEncoder().withoutPadding().encodeToString(
+                    MessageDigest.getInstance("SHA-256").digest(verifier.getBytes(StandardCharsets.US_ASCII)));
+            byte[] sb = new byte[16]; rnd.nextBytes(sb);
+            String state = Base64.getUrlEncoder().withoutPadding().encodeToString(sb);
+
+            com.sun.net.httpserver.HttpServer server = com.sun.net.httpserver.HttpServer.create(
+                    new java.net.InetSocketAddress(java.net.InetAddress.getLoopbackAddress(), 0), 0);
+            try {
+                server.createContext("/", ex -> {
+                    java.util.Map<String, String> q = new java.util.HashMap<>();
+                    String raw = ex.getRequestURI().getRawQuery();
+                    if (raw != null) for (String kv : raw.split("&")) {
+                        int i = kv.indexOf('=');
+                        if (i > 0) q.put(kv.substring(0, i), java.net.URLDecoder.decode(kv.substring(i + 1), "UTF-8"));
+                    }
+                    boolean relevant = q.containsKey("code") || q.containsKey("error");
+                    String page = "<html><body style='font-family:sans-serif;text-align:center;margin-top:15%'>"
+                            + "<h2>" + (relevant ? "You can close this tab and return to Royal Gambit." : "Royal Gambit") + "</h2></body></html>";
+                    byte[] b = page.getBytes(StandardCharsets.UTF_8);
+                    ex.getResponseHeaders().set("Content-Type", "text/html; charset=UTF-8");
+                    ex.sendResponseHeaders(200, b.length);
+                    try (OutputStream o = ex.getResponseBody()) { o.write(b); }
+                    if (relevant) session.result.complete(q);       // ignore stray requests such as /favicon.ico
+                });
+                server.start();
+                String redirect = "http://127.0.0.1:" + server.getAddress().getPort();
+
+                String url = "https://accounts.google.com/o/oauth2/v2/auth"
+                        + "?client_id=" + enc(clientId)
+                        + "&redirect_uri=" + enc(redirect)
+                        + "&response_type=code"
+                        + "&scope=" + enc("openid email profile")
+                        + "&state=" + state
+                        + "&code_challenge=" + challenge
+                        + "&code_challenge_method=S256"
+                        + "&prompt=select_account";
+                if (!Desktop.isDesktopSupported() || !Desktop.getDesktop().isSupported(Desktop.Action.BROWSE))
+                    throw new IOException("Cannot open a web browser on this computer");
+                Desktop.getDesktop().browse(new java.net.URI(url));
+
+                java.util.Map<String, String> q;
+                try { q = session.result.get(3, java.util.concurrent.TimeUnit.MINUTES); }
+                catch (java.util.concurrent.ExecutionException ee) {
+                    if (ee.getCause() instanceof Cancelled) throw new Cancelled();
+                    throw ee;
+                }
+                catch (java.util.concurrent.TimeoutException te) { throw new IOException("Google sign-in timed out. Please try again."); }
+
+                if (q.containsKey("error")) throw new Cancelled();             // player pressed Cancel/Deny in the browser
+                if (!state.equals(q.get("state"))) throw new IOException("Sign-in response did not match. Please try again.");
+
+                String form = "code=" + enc(q.get("code"))
+                        + "&client_id=" + enc(clientId)
+                        + (secret.isEmpty() ? "" : "&client_secret=" + enc(secret))
+                        + "&redirect_uri=" + enc(redirect)
+                        + "&grant_type=authorization_code"
+                        + "&code_verifier=" + enc(verifier);
+                String json = post("https://oauth2.googleapis.com/token", form);
+                String idToken = jsonStr(json, "id_token");
+                if (idToken == null) throw new IOException("Google did not return an ID token");
+
+                // The token came straight from Google over HTTPS, so its signature need not be checked again.
+                String[] parts = idToken.split("\\.");
+                if (parts.length < 2) throw new IOException("Invalid ID token");
+                String payload = new String(Base64.getUrlDecoder().decode(parts[1]), StandardCharsets.UTF_8);
+                if (!clientId.equals(jsonStr(payload, "aud"))) throw new IOException("ID token was issued for another app");
+                String email = jsonStr(payload, "email");
+                String verified = jsonRaw(payload, "email_verified");
+                if (email == null || !"true".equals(verified)) throw new IOException("Your Google email is not verified");
+                String name = jsonStr(payload, "name");
+                return new String[] { email, name == null ? "" : name };
+            } finally {
+                server.stop(0);
+            }
+        }
+
+        static String enc(String v) throws IOException { return java.net.URLEncoder.encode(v, "UTF-8"); }
+
+        static String post(String url, String form) throws IOException {
+            java.net.HttpURLConnection h = (java.net.HttpURLConnection) java.net.URI.create(url).toURL().openConnection();
+            h.setConnectTimeout(15000);
+            h.setReadTimeout(15000);
+            h.setRequestMethod("POST");
+            h.setDoOutput(true);
+            h.setRequestProperty("Content-Type", "application/x-www-form-urlencoded");
+            try (OutputStream o = h.getOutputStream()) { o.write(form.getBytes(StandardCharsets.UTF_8)); }
+            int code = h.getResponseCode();
+            InputStream is = code >= 400 ? h.getErrorStream() : h.getInputStream();
+            String body = "";
+            if (is != null) try (InputStream in = is) { body = new String(in.readAllBytes(), StandardCharsets.UTF_8); }
+            if (code >= 400) {
+                String d = jsonStr(body, "error_description");
+                if (d == null) d = jsonStr(body, "error");
+                throw new IOException("Google said: " + (d == null ? "HTTP " + code : d));
+            }
+            return body;
+        }
+
+        // ----- tiny JSON helpers (the payloads are flat, so no library is needed) -----
+        static String jsonStr(String json, String key) {
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("\"" + key + "\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"").matcher(json);
+            if (!m.find()) return null;
+            String v = m.group(1);
+            StringBuilder out = new StringBuilder();
+            for (int i = 0; i < v.length(); i++) {
+                char ch = v.charAt(i);
+                if (ch != '\\' || i + 1 >= v.length()) { out.append(ch); continue; }
+                char n = v.charAt(++i);
+                switch (n) {
+                    case 'n': out.append('\n'); break;
+                    case 't': out.append('\t'); break;
+                    case 'u': out.append((char) Integer.parseInt(v.substring(i + 1, i + 5), 16)); i += 4; break;
+                    default: out.append(n);
+                }
+            }
+            return out.toString();
+        }
+        static String jsonRaw(String json, String key) {
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("\"" + key + "\"\\s*:\\s*\"?([A-Za-z0-9]+)\"?").matcher(json);
+            return m.find() ? m.group(1) : null;
+        }
+    }
+
+    // =====================================================================
+    //  "Continue with Google" button
+    // =====================================================================
+    static class GoogleButton extends JButton {
+        boolean hover;
+        GoogleButton(String t) {
+            super(t);
+            setContentAreaFilled(false); setFocusPainted(false); setBorderPainted(false); setOpaque(false);
+            setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+            addMouseListener(new MouseAdapter() {
+                @Override public void mouseEntered(MouseEvent e) { hover = true; repaint(); }
+                @Override public void mouseExited(MouseEvent e) { hover = false; repaint(); }
+            });
+        }
+        @Override protected void paintComponent(Graphics g0) {
+            Graphics2D g = (Graphics2D) g0.create();
+            aa(g);
+            int w = getWidth(), h = getHeight() - getInsets().bottom;
+            int r = Math.max(6, h / 6);
+            g.setColor(getModel().isPressed() ? new Color(0xE3E3E3) : hover ? new Color(0xF4F4F4) : Color.WHITE);
+            g.fill(new RoundRectangle2D.Float(0, 0, w, h, r, r));
+            Font f = getFont();
+            FontMetrics fm = g.getFontMetrics(f);
+            Font gf = f.deriveFont(Font.BOLD, f.getSize2D() * 1.25f);
+            FontMetrics gm = g.getFontMetrics(gf);
+            int gap = Math.max(8, h / 4);
+            int total = gm.stringWidth("G") + gap + fm.stringWidth(getText());
+            int x = (w - total) / 2;
+            g.setFont(gf);
+            g.setColor(new Color(0x4285F4));
+            g.drawString("G", x, (h - gm.getHeight()) / 2 + gm.getAscent());
+            g.setFont(f);
+            g.setColor(new Color(0x3C4043));
+            g.drawString(getText(), x + gm.stringWidth("G") + gap, (h - fm.getHeight()) / 2 + fm.getAscent());
+            g.dispose();
         }
     }
 
@@ -424,7 +665,7 @@ public class RoyalGambit {
         /** @return SUCCESS, USERNAME_TAKEN or EMAIL_TAKEN */
         synchronized int register(String user, String email, String pw) throws Exception {
             String k = user.toLowerCase(Locale.ROOT);
-            if (p.containsKey(k + ".hash")) return USERNAME_TAKEN;
+            if (p.containsKey(k + ".hash") || p.containsKey(k + ".name")) return USERNAME_TAKEN;
             if (emailTaken(email)) return EMAIL_TAKEN;
             byte[] salt = new byte[16];
             new SecureRandom().nextBytes(salt);
@@ -434,6 +675,30 @@ public class RoyalGambit {
             p.setProperty(k + ".hash", Base64.getEncoder().encodeToString(hash(pw.toCharArray(), salt)));
             save();
             return SUCCESS;
+        }
+        /**
+         * Signs in (or creates) the account that belongs to a verified Google email.
+         * Google accounts have no password of their own.
+         * @return the Royal Gambit username
+         */
+        synchronized String loginWithGoogle(String email, String googleName) throws Exception {
+            String existing = keyForEmail(email);
+            if (existing != null) return p.getProperty(existing + ".name");
+
+            String source = googleName == null || googleName.isBlank() ? email.substring(0, email.indexOf('@')) : googleName;
+            String base = source.replaceAll("[^A-Za-z0-9_]", "");
+            if (base.length() < 3) base = "Player" + base;
+            if (base.length() > 12) base = base.substring(0, 12);
+            String name = base;
+            SecureRandom rnd = new SecureRandom();
+            while (p.containsKey(name.toLowerCase(Locale.ROOT) + ".name"))
+                name = base + String.format("%03d", rnd.nextInt(1000));
+            String k = name.toLowerCase(Locale.ROOT);
+            p.setProperty(k + ".name", name);
+            p.setProperty(k + ".email", email);
+            p.setProperty(k + ".google", "true");
+            save();
+            return name;
         }
         /** @return the account's display name on success, otherwise null */
         synchronized String login(String user, String pw) throws Exception {
@@ -527,6 +792,7 @@ public class RoyalGambit {
         final Link forgot = new Link("Forgot password?", this::forgotPassword);
         final Link switchLink = new Link("Log In", () -> setMode(!registerMode));
         final GoldButton submit = new GoldButton("REGISTER");
+        final GoogleButton googleBtn = new GoogleButton("Continue with Google");
         final JPanel termsRow = row(), loginRow = row(), switchRow = row(), guestRow = row();
         final Link guestLink = new Link("Play as Guest", () -> onGuest(this));
 
@@ -569,11 +835,12 @@ public class RoyalGambit {
             guestRow.add(guestLink);
             guestRow.add(Box.createHorizontalGlue());
 
-            JComponent[] all = { titleLbl, user, email, pass, termsRow, loginRow, msg, submit, switchRow, guestRow };
+            JComponent[] all = { titleLbl, user, email, pass, termsRow, loginRow, msg, submit, googleBtn, switchRow, guestRow };
             for (JComponent c : all) { c.setAlignmentX(Component.CENTER_ALIGNMENT); add(c); }
             loginRow.setVisible(false);
 
             submit.addActionListener(e -> submit());
+            googleBtn.addActionListener(e -> googleSignIn());
             for (Input in : new Input[] { user, email, pass }) {
                 in.field.addActionListener(e -> submit.doClick());
                 in.field.addKeyListener(new KeyAdapter() {
@@ -627,6 +894,9 @@ public class RoyalGambit {
             submit.setBorder(new EmptyBorder(0, 0, btnGap, 0));
             submit.setFont(new Font(SANS, Font.BOLD, Math.round(base * 1.15f)));
             fix(submit, innerW, fh + btnGap);
+            googleBtn.setBorder(new EmptyBorder(0, 0, btnGap, 0));
+            googleBtn.setFont(new Font(SANS, Font.BOLD, Math.round(base * 1.05f)));
+            fix(googleBtn, innerW, fh + btnGap);
 
             fix(switchRow, innerW, (int) (base * 1.8));
             guestRow.setBorder(new EmptyBorder((int) (gap * 0.6), 0, 0, 0));
@@ -697,6 +967,63 @@ public class RoyalGambit {
             }
         }
 
+        void googleSignIn() {
+            if (registerMode && !terms.selected) { fail(null, "Please accept the Terms of Service"); return; }
+            if (!GoogleAuth.configured()) {
+                JOptionPane.showMessageDialog(this,
+                        "Google sign-in is not set up on this computer yet.\n\n"
+                        + "Create the file:\n" + GoogleAuth.CONFIG.getAbsolutePath() + "\n"
+                        + "with these two lines:\nclient_id=YOUR_CLIENT_ID\nclient_secret=YOUR_CLIENT_SECRET",
+                        "Google sign-in", JOptionPane.WARNING_MESSAGE);
+                return;
+            }
+            clearErrors();
+            final GoogleAuth.Session session = new GoogleAuth.Session();
+
+            final JDialog wait = new JDialog(SwingUtilities.getWindowAncestor(this), "Google sign-in",
+                    Dialog.ModalityType.APPLICATION_MODAL);
+            wait.setDefaultCloseOperation(WindowConstants.DO_NOTHING_ON_CLOSE);
+            wait.setResizable(false);
+            JProgressBar bar = new JProgressBar();
+            bar.setIndeterminate(true);
+            JButton cancel = new JButton("Cancel");
+            cancel.addActionListener(ev -> session.cancel());
+            wait.addWindowListener(new WindowAdapter() {
+                @Override public void windowClosing(WindowEvent we) { session.cancel(); }
+            });
+            JPanel box = new JPanel(new BorderLayout(0, 12));
+            box.setBorder(new EmptyBorder(18, 24, 14, 24));
+            box.add(new JLabel("Finish signing in with Google in your browser...", SwingConstants.CENTER), BorderLayout.NORTH);
+            box.add(bar, BorderLayout.CENTER);
+            JPanel south = new JPanel(new FlowLayout(FlowLayout.CENTER, 0, 0));
+            south.add(cancel);
+            box.add(south, BorderLayout.SOUTH);
+            wait.getContentPane().add(box);
+            wait.pack();
+            wait.setSize(Math.max(wait.getWidth(), 360), wait.getHeight());
+            wait.setLocationRelativeTo(this);
+
+            new SwingWorker<String[], Void>() {
+                @Override protected String[] doInBackground() throws Exception { return GoogleAuth.signIn(session); }
+                @Override protected void done() {
+                    wait.dispose();
+                    try {
+                        String[] g = get();
+                        String name = store.loginWithGoogle(g[0], g[1]);
+                        prefs.remove("lastUser");
+                        onLoginSuccess(AuthForm.this, name);
+                    } catch (java.util.concurrent.ExecutionException ee) {
+                        Throwable c = ee.getCause();
+                        if (c instanceof GoogleAuth.Cancelled) { msg.setText(" "); return; }
+                        fail(null, "Google sign-in failed: " + (c instanceof Exception ? Mailer.friendly((Exception) c) : c));
+                    } catch (Exception ex) {
+                        fail(null, "Google sign-in failed: " + ex.getMessage());
+                    }
+                }
+            }.execute();
+            wait.setVisible(true);          // blocks until done() closes it (or the player cancels)
+        }
+
         /** Creates a fresh code (replacing any old one) and emails it. @return null if the email is unknown. */
         String[] issueAndSendCode(String email) throws Exception {
             String[] r = store.createResetCode(email);
@@ -716,21 +1043,37 @@ public class RoyalGambit {
                     "Reset password", JOptionPane.PLAIN_MESSAGE);
             if (e == null || e.isBlank()) return;
             final String email = e.trim();
-            if (!email.matches("^[\\w.+-]+@[\\w-]+(\\.[\\w-]+)+$")) { fail(null, "Please enter a valid email"); return; }
+            if (!email.matches("^[\\w.+-]+@[\\w-]+(\\.[\\w-]+)+$")) {
+                JOptionPane.showMessageDialog(this, "Please enter a valid email account.",
+                        "Invalid email", JOptionPane.ERROR_MESSAGE);
+                return;
+            }
 
             msg.setForeground(MUTED);
             msg.setText("Sending reset code...");
+            final LoadingDialog loading = new LoadingDialog(this, "Sending reset code...");
+            loading.start();
             new SwingWorker<String, Void>() {
                 @Override protected String doInBackground() {
-                    try { issueAndSendCode(email); return null; }
-                    catch (Exception ex) { return ex.getMessage(); }
+                    try {
+                        // null result = code sent; otherwise an error message
+                        return issueAndSendCode(email) == null ? "NOT_FOUND" : null;
+                    } catch (Exception ex) { return Mailer.friendly(ex); }
                 }
                 @Override protected void done() {
+                    loading.close();
                     String err;
                     try { err = get(); } catch (Exception ex) { err = ex.getMessage(); }
+                    if ("NOT_FOUND".equals(err)) {
+                        msg.setText(" ");
+                        JOptionPane.showMessageDialog(AuthForm.this,
+                                "No account is linked to that email. Please enter a valid email account.",
+                                "Invalid email", JOptionPane.ERROR_MESSAGE);
+                        return;
+                    }
                     if (err != null) { fail(null, "Could not send email: " + err); return; }
                     msg.setForeground(OK);
-                    msg.setText("If that email is registered, a code was sent");
+                    msg.setText("A reset code was sent to your email");
                     showResetDialog(email);
                 }
             }.execute();
@@ -791,12 +1134,15 @@ public class RoyalGambit {
                 sending[0] = true;
                 err.setText(" ");
                 refresh.run();
+                final LoadingDialog loading = new LoadingDialog(d, "Sending a new code...");
+                loading.start();
                 new SwingWorker<String, Void>() {
                     @Override protected String doInBackground() {
                         try { issueAndSendCode(email); return null; }
-                        catch (Exception ex) { return ex.getMessage(); }
+                        catch (Exception ex) { return Mailer.friendly(ex); }
                     }
                     @Override protected void done() {
+                        loading.close();
                         sending[0] = false;
                         String er;
                         try { er = get(); } catch (Exception ex) { er = ex.getMessage(); }
@@ -834,6 +1180,8 @@ public class RoyalGambit {
                     setMode(false);                       // go to "Welcome Back"
                     msg.setForeground(OK);
                     msg.setText("Password updated - please log in");
+                    JOptionPane.showMessageDialog(this, "You successfully reset your password.",
+                            "Password reset", JOptionPane.INFORMATION_MESSAGE);
                 } else {
                     err.setForeground(RoyalGambit.ERROR);
                     err.setText(er);
